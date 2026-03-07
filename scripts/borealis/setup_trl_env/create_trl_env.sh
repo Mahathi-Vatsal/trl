@@ -3,12 +3,13 @@
 
 : "${conda_env_name:?ERROR: Conda environment name is not set}"
 : "${username:?ERROR: username is not set; Enter your username}"
+: "${trl_repo_path:?ERROR: set the path to trl repo}"
 
 source /home/${username}/miniforge3/etc/profile.d/conda.sh
 conda create -y --name ${conda_env_name} python=3.10
 conda activate ${conda_env_name}
 
-cd /home/msalopan/peft/trl 
+cd ${trl_repo_path}/trl 
 pip install e .
 cd -
 pip install -U transformers accelerate datasets safetensors
