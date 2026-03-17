@@ -1,5 +1,5 @@
 diff --git a/trl/scripts/sft.py b/trl/scripts/sft.py
-index a900a3e6..ac574d41 100644
+index a900a3e6..dba22101 100644
 --- a/trl/scripts/sft.py
 +++ b/trl/scripts/sft.py
 @@ -81,6 +81,37 @@ from trl import (
@@ -40,7 +40,7 @@ index a900a3e6..ac574d41 100644
  
  logger = logging.get_logger(__name__)
  
-@@ -138,10 +169,13 @@ def main(script_args, training_args, model_args, dataset_args):
+@@ -138,10 +169,16 @@ def main(script_args, training_args, model_args, dataset_args):
          train_dataset=dataset[script_args.dataset_train_split],
          eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
          peft_config=get_peft_config(model_args),
@@ -48,9 +48,13 @@ index a900a3e6..ac574d41 100644
      )
  
      # Train the model
-     trainer.train()
+-    trainer.train()
++    train_out = trainer.train()
 +    m = train_out.metrics
-+    print("overall_train_tps =", m["num_input_tokens_seen"] / m["train_runtime"])
++    if "num_input_tokens_seen" in m and "train_runtime" in m and m["train_runtime"] > 0:
++        print("overall_train_tokens_per_second:", m["num_input_tokens_seen"] / m["train_runtime"])
++    else:
++        print("Throughput not available in metrics:", m.keys())
  
      # Log training complete
      trainer.accelerator.print("✅ Training completed.")
