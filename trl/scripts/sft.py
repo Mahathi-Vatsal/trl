@@ -63,21 +63,32 @@ python trl/scripts/sft.py \
 import argparse
 import os
 
+from accelerate import logging
+from datasets import load_dataset
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+
+from trl import (
+    DatasetMixtureConfig,
+    ModelConfig,
+    ScriptArguments,
+    SFTConfig,
+    SFTTrainer,
+    TrlParser,
+    get_dataset,
+    get_kbit_device_map,
+    get_peft_config,
+    get_quantization_config,
+)
+
+
+logger = logging.get_logger(__name__)
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 def main(script_args, training_args, model_args, dataset_args):
-    from accelerate import logging
-    from datasets import load_dataset
-    from transformers import AutoConfig, AutoModelForCausalLM
-    from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
-
-    from trl import SFTTrainer, get_dataset, get_kbit_device_map, get_peft_config, get_quantization_config
-
-    logger = logging.get_logger(__name__)
-
     ################
     # Model init kwargs
     ################
@@ -94,15 +105,29 @@ def main(script_args, training_args, model_args, dataset_args):
         model_kwargs["quantization_config"] = quantization_config
 
     # Create model
-    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
+    config = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=model_kwargs.get("trust_remote_code", False))
+
+    def _as_int_token_id(x, default=0):
+        # x can be int, list[int], tuple[int], None
+        if x is None:
+            return default
+        if isinstance(x, (list, tuple)):
+            return int(x[0]) if len(x) > 0 else default
+        return int(x)
+
+
+    config.eos_token_id = _as_int_token_id(getattr(config, "eos_token_id", None), default=0)
+    config.pad_token_id = _as_int_token_id(getattr(config, "pad_token_id", None), default=config.eos_token_id)
+
     valid_image_text_architectures = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.values()
 
     if config.architectures and any(arch in valid_image_text_architectures for arch in config.architectures):
         from transformers import AutoModelForImageTextToText
 
-        model = AutoModelForImageTextToText.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+        model = AutoModelForImageTextToText.from_pretrained(model_args.model_name_or_path, config=config, **model_kwargs)
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, config=config, **model_kwargs)
 
     # Load the dataset
     if dataset_args.datasets and script_args.dataset_name:
@@ -126,11 +151,47 @@ def main(script_args, training_args, model_args, dataset_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
+        peft_config=get_peft_config(model_args)
     )
 
     # Train the model
-    trainer.train()
+    train_out = trainer.train()
+
+    import torch
+    import os
+    import torch.distributed as dist
+    m = train_out.metrics
+
+    runtime = m.get("train_runtime", None)
+
+    tokens = getattr(trainer.state, "num_input_tokens_seen", None)
+    if tokens is None:
+        tokens = next((x.get("num_input_tokens_seen") for x in reversed(trainer.state.log_history)
+                       if "num_input_tokens_seen" in x),
+                      None
+                      )
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"xpu:{local_rank}")
+
+        t_tokens = torch.tensor([int(tokens or 0)], device=device, dtype=torch.long)
+        t_time   = torch.tensor([float(runtime or 0.0)], device=device, dtype=torch.float64)
+
+        dist.all_reduce(t_tokens, op=dist.ReduceOp.MAX)
+        dist.all_reduce(t_time,   op=dist.ReduceOp.MAX)
+
+        tokens = int(t_tokens.item())
+        runtime = float(t_time.item())
+
+    if trainer.is_world_process_zero():
+        if runtime and tokens and runtime > 0:
+            print("GLOBAL overall_train_tokens_per_second:", tokens / runtime)
+        else:
+            print("Could not compute throughput. runtime=", runtime, "tokens=", tokens)
+            print("metrics keys:", m.keys())
+            print("last logs:", trainer.state.log_history[-3:])
 
     # Log training complete
     trainer.accelerator.print("✅ Training completed.")
@@ -144,18 +205,21 @@ def main(script_args, training_args, model_args, dataset_args):
         trainer.accelerator.print(f"🤗 Model pushed to the Hub in https://huggingface.co/{trainer.hub_model_id}.")
 
 
-def make_parser(subparsers: argparse._SubParsersAction | None = None, prog: str | None = None):
-    from trl import DatasetMixtureConfig, ModelConfig, ScriptArguments, SFTConfig, TrlParser
-
+def make_parser(subparsers: argparse._SubParsersAction | None = None):
     dataclass_types = (ScriptArguments, SFTConfig, ModelConfig, DatasetMixtureConfig)
     if subparsers is not None:
         parser = subparsers.add_parser("sft", help="Run the SFT training script", dataclass_types=dataclass_types)
     else:
-        parser = TrlParser(dataclass_types, prog=prog)
+        parser = TrlParser(dataclass_types)
     return parser
 
 
 if __name__ == "__main__":
     parser = make_parser()
-    script_args, training_args, model_args, dataset_args = parser.parse_args_and_config(fail_with_unknown_args=False)
+    # When using the trl cli, this script may be run with additional arguments, corresponding accelerate arguments.
+    # To ensure that their parsing does not interfere with the script arguments, parse the arguments with
+    # `return_remaining_strings=True`, then ignore the remaining strings.
+    script_args, training_args, model_args, dataset_args, _ = parser.parse_args_and_config(
+        return_remaining_strings=True
+    )
     main(script_args, training_args, model_args, dataset_args)

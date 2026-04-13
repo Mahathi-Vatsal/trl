@@ -1,60 +1,87 @@
 diff --git a/trl/scripts/sft.py b/trl/scripts/sft.py
-index a900a3e6..dba22101 100644
+index a900a3e6..8e08be26 100644
 --- a/trl/scripts/sft.py
 +++ b/trl/scripts/sft.py
-@@ -81,6 +81,37 @@ from trl import (
-     get_quantization_config,
- )
+@@ -105,15 +105,29 @@ def main(script_args, training_args, model_args, dataset_args):
+         model_kwargs["quantization_config"] = quantization_config
  
-+import time
-+from transformers import TrainerCallback
+     # Create model
+-    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
++    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
++    config = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=model_kwargs.get("trust_remote_code", False))
 +
-+class TokensPerSecondCallback(TrainerCallback):
-+    def __init__(self):
-+        self.t0 = None
-+        self.tokens0 = None
-+        self.last_tps = None
++    def _as_int_token_id(x, default=0):
++        # x can be int, list[int], tuple[int], None
++        if x is None:
++            return default
++        if isinstance(x, (list, tuple)):
++            return int(x[0]) if len(x) > 0 else default
++        return int(x)
 +
-+    def on_log(self, args, state, control, logs=None, **kwargs):
-+        if logs is None:
-+            return
-+        tokens = logs.get("num_input_tokens_seen")
-+        if tokens is None:
-+            return
 +
-+        now = time.perf_counter()
-+        if self.t0 is None:
-+            self.t0, self.tokens0 = now, tokens
-+            return
++    config.eos_token_id = _as_int_token_id(getattr(config, "eos_token_id", None), default=0)
++    config.pad_token_id = _as_int_token_id(getattr(config, "pad_token_id", None), default=config.eos_token_id)
 +
-+        dt = now - self.t0
-+        dtk = tokens - self.tokens0
-+        if dt > 0 and dtk > 0:
-+            self.last_tps = dtk / dt
-+
-+        if self.last_tps is not None:
-+            logs["tokens_per_second"] = self.last_tps
-+
-+        self.t0, self.tokens0 = now, tokens
-+
+     valid_image_text_architectures = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.values()
  
- logger = logging.get_logger(__name__)
+     if config.architectures and any(arch in valid_image_text_architectures for arch in config.architectures):
+         from transformers import AutoModelForImageTextToText
  
-@@ -138,10 +169,16 @@ def main(script_args, training_args, model_args, dataset_args):
+-        model = AutoModelForImageTextToText.from_pretrained(model_args.model_name_or_path, **model_kwargs)
++        model = AutoModelForImageTextToText.from_pretrained(model_args.model_name_or_path, config=config, **model_kwargs)
+     else:
+-        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
++        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, config=config, **model_kwargs)
+ 
+     # Load the dataset
+     if dataset_args.datasets and script_args.dataset_name:
+@@ -137,11 +151,47 @@ def main(script_args, training_args, model_args, dataset_args):
+         args=training_args,
          train_dataset=dataset[script_args.dataset_train_split],
          eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-         peft_config=get_peft_config(model_args),
-+        callbacks=[TokensPerSecondCallback()]
+-        peft_config=get_peft_config(model_args),
++        peft_config=get_peft_config(model_args)
      )
  
      # Train the model
 -    trainer.train()
 +    train_out = trainer.train()
++
++    import torch
++    import os
++    import torch.distributed as dist
 +    m = train_out.metrics
-+    if "num_input_tokens_seen" in m and "train_runtime" in m and m["train_runtime"] > 0:
-+        print("overall_train_tokens_per_second:", m["num_input_tokens_seen"] / m["train_runtime"])
-+    else:
-+        print("Throughput not available in metrics:", m.keys())
++
++    runtime = m.get("train_runtime", None)
++
++    tokens = getattr(trainer.state, "num_input_tokens_seen", None)
++    if tokens is None:
++        tokens = next((x.get("num_input_tokens_seen") for x in reversed(trainer.state.log_history)
++                       if "num_input_tokens_seen" in x),
++                      None
++                      )
++    if dist.is_available() and dist.is_initialized():
++        dist.barrier()
++
++        local_rank = int(os.environ.get("LOCAL_RANK", 0))
++        device = torch.device(f"xpu:{local_rank}")
++
++        t_tokens = torch.tensor([int(tokens or 0)], device=device, dtype=torch.long)
++        t_time   = torch.tensor([float(runtime or 0.0)], device=device, dtype=torch.float64)
++
++        dist.all_reduce(t_tokens, op=dist.ReduceOp.MAX)
++        dist.all_reduce(t_time,   op=dist.ReduceOp.MAX)
++
++        tokens = int(t_tokens.item())
++        runtime = float(t_time.item())
++
++    if trainer.is_world_process_zero():
++        if runtime and tokens and runtime > 0:
++            print("GLOBAL overall_train_tokens_per_second:", tokens / runtime)
++        else:
++            print("Could not compute throughput. runtime=", runtime, "tokens=", tokens)
++            print("metrics keys:", m.keys())
++            print("last logs:", trainer.state.log_history[-3:])
  
      # Log training complete
      trainer.accelerator.print("✅ Training completed.")
